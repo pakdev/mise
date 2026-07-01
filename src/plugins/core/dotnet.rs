@@ -72,14 +72,39 @@ impl DotnetPlugin {
             // Skip version check for runtime-only installs — `dotnet --version` exits non-zero without an SDK
             return Ok(());
         }
-        ctx.pr.set_message("dotnet --version".into());
+
+        // Use `dotnet --list-sdks` to verify the SDK was installed.
+        //
+        // `dotnet --version` is influenced by `global.json` in the current working directory:
+        // if a project pins a different SDK (e.g. 10.0.300) than the one being installed
+        // (e.g. 8.0.421), the version check would fail even though 8.0.421 was installed
+        // successfully. `--list-sdks` reports the installed SDK inventory and is not
+        // affected by `global.json` SDK selection.
+        ctx.pr.set_message("dotnet --list-sdks".into());
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let collected_clone = collected.clone();
         CmdLineRunner::new(DOTNET_BIN)
             .with_pr(ctx.pr.as_ref())
-            .arg("--version")
+            .arg("--list-sdks")
             .envs(tv.install_env())
             .envs(self.exec_env(&ctx.config, &ctx.ts, tv).await?)
             .prepend_path(self.list_bin_paths(&ctx.config, tv).await?)?
-            .execute()
+            .with_on_stdout(move |line| {
+                let mut out = collected_clone.lock().unwrap();
+                out.push_str(&line);
+                out.push('\n');
+            })
+            .execute()?;
+
+        let output = collected.lock().unwrap();
+        if !sdk_version_in_list(&tv.version, &output) {
+            return Err(eyre::eyre!(
+                "dotnet SDK {} not found after install. Installed SDKs:\n{}",
+                tv.version,
+                output.trim()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -282,6 +307,23 @@ impl Backend for DotnetPlugin {
         }
         Ok(env)
     }
+}
+
+/// Returns true when `version` appears as an installed SDK in the output of
+/// `dotnet --list-sdks`.  Each line in that output looks like:
+///
+/// ```text
+/// 8.0.421 [/path/to/sdk]
+/// 10.0.300 [/path/to/sdk]
+/// ```
+///
+/// We require the line to start with `"{version} "` (note the trailing space)
+/// to avoid prefix false-positives (e.g. `8.0.4` matching `8.0.42`).
+fn sdk_version_in_list(version: &str, list_sdks_output: &str) -> bool {
+    let prefix = format!("{version} ");
+    list_sdks_output
+        .lines()
+        .any(|line| line.starts_with(&prefix))
 }
 
 fn runtime_framework_name(runtime: &str) -> Option<&'static str> {
@@ -502,5 +544,51 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // --- sdk_version_in_list ---
+
+    #[test]
+    fn sdk_version_in_list_finds_exact_match() {
+        let output = "8.0.421 [/usr/share/dotnet/sdk]\n10.0.300 [/usr/share/dotnet/sdk]\n";
+        assert!(sdk_version_in_list("8.0.421", output));
+        assert!(sdk_version_in_list("10.0.300", output));
+    }
+
+    #[test]
+    fn sdk_version_in_list_not_found() {
+        let output = "10.0.300 [/usr/share/dotnet/sdk]\n";
+        assert!(!sdk_version_in_list("8.0.421", output));
+    }
+
+    #[test]
+    fn sdk_version_in_list_no_prefix_false_positive() {
+        // "8.0.42" must NOT match a line for "8.0.421"
+        let output = "8.0.421 [/usr/share/dotnet/sdk]\n";
+        assert!(!sdk_version_in_list("8.0.42", output));
+    }
+
+    /// Regression test: when global.json pins 10.0.300, installing 8.0.421 first
+    /// would make `dotnet --version` report 10.0.300 (or fail) even though 8.0.421
+    /// is installed.  `sdk_version_in_list` checks the inventory and must succeed
+    /// as long as 8.0.421 appears in the list regardless of what --version returns.
+    #[test]
+    fn sdk_version_in_list_global_json_mismatch_scenario() {
+        // Simulate: global.json pins 10.0.300; both SDKs are installed.
+        // `dotnet --version` would return "10.0.300" (or error), but --list-sdks
+        // returns both versions.
+        let list_sdks_output =
+            "8.0.421 [/home/user/.local/share/mise/dotnet-root/sdk]\n\
+             10.0.300 [/home/user/.local/share/mise/dotnet-root/sdk]\n";
+
+        // Verifying 8.0.421 must pass even though global.json selects 10.0.300.
+        assert!(sdk_version_in_list("8.0.421", list_sdks_output));
+        // Verifying 10.0.300 also passes.
+        assert!(sdk_version_in_list("10.0.300", list_sdks_output));
+    }
+
+    #[test]
+    fn sdk_version_in_list_empty_output() {
+        assert!(!sdk_version_in_list("8.0.421", ""));
     }
 }
